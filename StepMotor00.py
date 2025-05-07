@@ -1,18 +1,14 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 #import required libraries
-import numpy as np
+import numpy as np 
 import pandas as pd
 import sklearn
 import sklearn.preprocessing
 import joblib
 from time import sleep
 import time
-import RPi.GPIO as GPIO
+import RPi.GPIO as GPIO 
 import serial
 import struct
-
 #variable decleration.Change this based on your system
 driverPUL=12
 driverDIR=18
@@ -66,7 +62,7 @@ class StepperMotor:
             steps = steps - (steps_to_max_velocity) #remianing_steps
             self._move_with_constant_velocity(steps, direction)
         elif steps<0:
-            # Deceleration phase
+        # Deceleration phase
             self._move_with_deceleration(steps, direction)
         else:
             print("Sorry, something is being passed Wrong")
@@ -144,15 +140,9 @@ def calibrate_steps(steps):
         GPIO.output(driverPUL, GPIO.LOW)
         sleep(0.003)
         
-# Establish serial communication 
-# **在此改为新的树莓派默认硬件串口 /dev/serial0，波特率设为 9600** 
-ser=serial.Serial(
-    port='/dev/serial0',
-    baudrate=9600, 
-    timeout=1,
-    parity=serial.PARITY_NONE,
-    stopbits=serial.STOPBITS_ONE
-)
+# Establish serial communication   
+ser=serial.Serial('/dev/ttyAMA0', 9600, timeout=5, parity=serial.PARITY_NONE,
+                  stopbits=serial.STOPBITS_ONE)
 
 #Do not change these variables
 calibration = False
@@ -161,7 +151,6 @@ num_Test = 0
 experiment = False
 iteration = False
 errorPercentage = False
-
 #calibration process
 while not calibration:
     calibrate = ser.readline().decode('utf-8').strip()
@@ -174,45 +163,52 @@ while not calibration:
             sleep(0.003)
 
         while not calibrated:
-            move_one_step = ser.readline()
-            move_one_step = int.from_bytes(move_one_step,"little")
-            if move_one_step == 1:#Move one step forward
+            move_one_step = ser.read(2)
+            if len(move_bytes) < 2:
+                continue
+            move_cmd = int.from_bytes(move_bytes, "little")
+            
+            if move_cmd == 1:#Move one step forward
                calibrate_steps(1)
 
-            if move_one_step == 2:#Move one step backward  
+            elif move_cmd == 2:#Move one step backward  
                calibrate_steps(-1)
 
-            if move_one_step == 3:#Come back 200 steps
+            elif move_cmd == 3:#Come back 200 steps
+                
+                calibrate_steps(-200)
                 calibrated = True
                 calibration = True
-                calibrate_steps(-200)
-              
-    if calibrate == 'No':
+                
+    elif calibrate == 'No':
         calibration = True
 
 #Receive Number of Tests
 motor = StepperMotor(driverPUL,driverDIR)
 while not experiment:
-    print("im here")
-    num_Test = ser.readline()
-    num_Test = int.from_bytes(num_Test,"little")
+    test_bytes = ser.read(2)
+    if len(test_bytes) < 2:
+        continue
+    num_Test = int.from_bytes(test_bytes,"little")
     if num_Test !=0:
         experiment = True
         
 #Receive Number of Iteration
 while not iteration:
-    num_iteration = ser.readline()
-    num_iteration = int.from_bytes(num_iteration,"little")
+    it_bytes = ser.read(2)
+    if len(it_bytes) < 2:
+        continue
+    num_iteration = int.from_bytes(it_bytes,"little")
     if num_iteration !=0:
         iteration = True
     
 #Receive Error_rate
 while not errorPercentage:
     errorRate = ser.read(4)
-    if len(errorRate) == 4:
-        errorRate = struct.unpack('<f', errorRate)[0]
-        print(errorRate)
-        if errorRate !=0:
+    if len(errorRateBytes) == 4:
+        errorRate = struct.unpack('<f', errorRateBytes)[0]
+        print("Eroor Rate:", errorRate)
+        if abs(errorRate) > 1e-9:
             errorPercentage = True
 
 #Model selection part: Based on the hammer tip
@@ -225,12 +221,12 @@ while not model_received:
 
     if choice == 'black':
         model = joblib.load('FinalModel_blackTip.pkl')
-        preprocess = Preprocessing(r'/home/labraspberry/StepMotor/processed data_blackTip.xlsx', 2)
+        preprocess = Preprocessing(r'/home/wanjin/StepMotor/processed data_blackTip.xlsx', 2)
         model_received = True
 
     elif choice == 'plastic':
         model = joblib.load('FinalModel_plasticTip.pkl')
-        preprocess = Preprocessing(r'/home/labraspberry/StepMotor/processed data_PlasticTip.xlsx', 4)
+        preprocess = Preprocessing(r'/home/wanjin/StepMotor/processed data_PlasticTip.xlsx', 4)
         model_received = True
 
 #Run Tests:
@@ -244,13 +240,15 @@ for _ in range(num_Test):
     error_acceptance_rate = False
 
     while not desiredF:
-        data=ser.readline()
-        dF=int.from_bytes(data, "little")
+        df_bytes = ser.read(2)
+        if len(df_bytes) < 2:
+            continue
+        dF=int.from_bytes(df_bytes, "little")
         if dF !=0:
-            print(dF)
-            inputs = np.array(dF).reshape(-1,1)
-            prediction = int(model.predict(preprocess.scale(preprocess.poly_transform(inputs))).item())
-            print(prediction)
+            print("Desired force:", dF)
+            force_input = np.array(dF).reshape(-1, 1)
+            prediction = int(model.predict(preprocess.scale(preprocess.poly_transform(force_input))).item())
+            print("Predicted velocity:", prediction)
             motor.last_speed = prediction
             acceleration = (prediction - motor.current_velocity)/Steps
             motor.set_acceleration(acceleration)
@@ -264,17 +262,19 @@ for _ in range(num_Test):
         motor.move_steps(Steps)
         motor.move_steps(-Steps)
         count +=1
-        forceRecieved=False   
+        forceRecieved=False 
+        fmax = 0.0  
         while not forceRecieved:
-            fmax=0
-            newdata=ser.read(4)
-            if len(newdata) == 4:
-                fmax=struct.unpack('<f',newdata)[0]
-                print(fmax)
-                if fmax != 0:
+            fmaxBytes = ser.read(4)
+            if len(fmaxBytes) == 4:
+                fmax=struct.unpack('<f', fmaxBytes)[0]
+                print("Fmax:", fmax)
+                if abs(fmax) > 1e-6:
                    forceRecieved=True
         
         error = (fmax - dF)/dF
+        print("Eroor =", error)
+        
         if abs(error) <= (errorRate/100):
             error_acceptance_rate = True
             acceleration_values.append(acceleration)
@@ -325,3 +325,9 @@ for _ in range(num_Test):
     #         repeatability= True
     #         ser.write(b'2')
     #         repeat = None
+            
+
+        
+
+
+

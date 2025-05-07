@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import numpy as np
+import pandas as pd
+import sklearn
+import sklearn.preprocessing
+import joblib
+from time import sleep
+import time
+import RPi.GPIO as GPIO
+import serial
+import struct
+
+driverPUL=12
+driverDIR=18
+Steps = 800  # you can change this if needed
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+GPIO.setup(driverPUL, GPIO.OUT)
+GPIO.setup(driverDIR, GPIO.OUT)
+
+class StepperMotor:
+    def __init__(self, step_pin, direction_pin):
+        self.step_pin = step_pin
+        self.direction_pin = direction_pin
+        self.acceleration = 10
+        self.max_velocity = 100000
+        self.deceleration = 10
+        self.current_velocity = 10
+        self.last_speed = None
+
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setwarnings(False)
+        GPIO.setup(self.step_pin, GPIO.OUT)
+        GPIO.setup(self.direction_pin, GPIO.OUT)
+
+    def set_acceleration(self, acceleration):
+        self.acceleration = acceleration
+
+    def set_max_velocity(self, max_velocity):
+        self.max_velocity = max_velocity
+
+    def set_deceleration(self, deceleration):
+        self.deceleration = deceleration
+
+    def move_steps(self, steps):
+        direction = GPIO.HIGH if steps > 0 else GPIO.LOW
+        GPIO.output(self.direction_pin, direction)
+        steps_to_max_velocity = (self.max_velocity - self.current_velocity) / self.acceleration
+        self.last_speed = self.current_velocity + abs(steps)*self.acceleration
+
+        if steps > 0 and abs(steps) <= steps_to_max_velocity:
+            self._move_with_acceleration(steps, direction)
+        elif steps > 0 and abs(steps) > steps_to_max_velocity:
+            # Acceleration phase
+            self._move_with_acceleration(steps_to_max_velocity, direction)
+            # Constant velocity phase
+            remaining = abs(steps) - steps_to_max_velocity
+            self._move_with_constant_velocity(remaining, direction)
+        elif steps < 0:
+            self._move_with_deceleration(steps, direction)
+        else:
+            print("move_steps: either steps=0 or something is wrong.")
+
+    def _move_with_acceleration(self, steps, direction):
+        # steps is a float, better int() it
+        steps = int(steps)
+        current_velocity = self.current_velocity
+        for i in range(abs(steps)):
+            delay = 1.0 / current_velocity
+            GPIO.output(self.step_pin, GPIO.HIGH)
+            time.sleep(delay)
+            GPIO.output(self.step_pin, GPIO.LOW)
+            time.sleep(delay)
+            current_velocity += self.acceleration
+        return
+
+    def _move_with_constant_velocity(self, steps, direction):
+        steps = int(steps)
+        delay = 1.0 / self.max_velocity
+        for i in range(steps):
+            GPIO.output(self.step_pin, GPIO.HIGH)
+            time.sleep(delay)
+            GPIO.output(self.step_pin, GPIO.LOW)
+            time.sleep(delay)
+
+    def _move_with_deceleration(self, steps, direction):
+        steps = abs(int(steps))
+        if self.last_speed is None:
+            return
+        current_velocity = self.last_speed
+        for i in range(steps):
+            delay = 1.0 / current_velocity
+            GPIO.output(self.step_pin, GPIO.HIGH)
+            time.sleep(delay)
+            GPIO.output(self.step_pin, GPIO.LOW)
+            time.sleep(delay)
+            current_velocity -= self.deceleration
+
+class Preprocessing:
+    def __init__(self, url, model_degree):
+        self.url = url
+        self.model_degree = model_degree
+        self.dataFrame = pd.read_excel(url, header=0)
+        self.features = np.array(self.dataFrame['Force']).reshape(-1, 1)
+        self.labels = np.array(self.dataFrame.drop(['Force'], axis=1)).reshape(-1, 1)
+        self.polynomial = sklearn.preprocessing.PolynomialFeatures(model_degree, include_bias=False)
+        self.Polynomial_features = self.polynomial.fit_transform(self.features)
+        self.scaler = sklearn.preprocessing.StandardScaler().fit(self.Polynomial_features)
+
+    def poly_transform(self, input_data):
+        return self.polynomial.transform(input_data)
+
+    def scale(self, input_data):
+        return self.scaler.transform(input_data)
+
+def calibrate_steps(steps):
+    direction = GPIO.HIGH if steps > 0 else GPIO.LOW
+    GPIO.output(driverDIR, direction)
+    for _ in range(abs(steps)):
+        GPIO.output(driverPUL, GPIO.HIGH)
+        sleep(0.003)
+        GPIO.output(driverPUL, GPIO.LOW)
+        sleep(0.003)
+
+ser = serial.Serial('/dev/ttyAMA10', 115200, timeout=1)
+calibration = False
+calibrated = False
+num_Test = 0
+experiment = False
+iteration = False
+errorPercentage = False
+
+while not calibration:
+    line = ser.readline().decode('utf-8').strip()
+    if line == 'Yes':
+        GPIO.output(driverDIR, GPIO.HIGH)
+        for i in range(10):
+            GPIO.output(driverPUL, GPIO.HIGH)
+            sleep(0.003)
+            GPIO.output(driverPUL, GPIO.LOW)
+            sleep(0.003)
+        while not calibrated:
+            step_str = ser.readline().decode('utf-8').strip()
+            if step_str.isdigit():
+                step_cmd = int(step_str)
+                if step_cmd == 1:
+                    calibrate_steps(1)
+                elif step_cmd == 2:
+                    calibrate_steps(-1)
+                elif step_cmd == 3:
+                    calibrate_steps(-200)
+                    calibrated = True
+                    calibration = True
+
+    elif line == 'No':
+        calibration = True
+
+motor = StepperMotor(driverPUL, driverDIR)
+
+while not experiment:
+    line = ser.readline().decode('utf-8').strip()
+    if line.isdigit():
+        num_Test = int(line)
+        if num_Test > 0:
+            experiment = True
+
+while not iteration:
+    line = ser.readline().decode('utf-8').strip()
+    if line.isdigit():
+        num_iteration = int(line)
+        if num_iteration > 0:
+            iteration = True
+
+while not errorPercentage:
+    err_str = ser.readline().decode('utf-8').strip()
+    try:
+        errorRate = float(err_str)
+        if errorRate != 0:
+            errorPercentage = True
+    except:
+        pass
+
+print("errorRate = ", errorRate)
+
+model_received = False
+model = None
+preprocess = None
+
+while not model_received:
+    choice = ser.readline().decode('utf-8').strip().lower()
+    if choice == 'black':
+        model = joblib.load('FinalModel_blackTip.pkl')
+        preprocess = Preprocessing(r'/home/wanjin/StepMotor/processed data_blackTip.xlsx', 2)
+        model_received = True
+    elif choice == 'plastic':
+        model = joblib.load('FinalModel_plasticTip.pkl')
+        preprocess = Preprocessing(r'/home/wanjin/StepMotor/processed data_PlasticTip.xlsx', 4)
+        model_received = True
+
+for _ in range(num_Test):
+    error = 0
+    acceleration = 0
+    count = 1
+    desiredF = False
+    error_acceptance_rate = False
+
+    while not desiredF:
+        df_str = ser.readline().decode('utf-8').strip()
+        if df_str.isdigit():
+            dF = int(df_str)
+            print("Desired Force (DF) =", dF)
+
+            inputs = np.array([[dF]])
+            X_poly = preprocess.poly_transform(inputs)
+            X_scaled = preprocess.scale(X_poly)
+            prediction = int(model.predict(X_scaled).item())
+
+            print("Predicted speed =", prediction)
+            motor.last_speed = prediction
+            acceleration = (prediction - motor.current_velocity)/Steps
+            motor.set_acceleration(acceleration)
+            motor.set_deceleration(acceleration)
+            desiredF = True
+
+    while not error_acceptance_rate:
+        ser.write(b"1\n")
+        sleep(2)
+
+        motor.move_steps(Steps)
+        motor.move_steps(-Steps)
+        count += 1
+
+        fmax = 0
+        while True:
+            fmax_str = ser.readline().decode('utf-8').strip()
+            try:
+                fmax = float(fmax_str)
+                if fmax != 0:
+                    break
+            except:
+                pass
+
+        print("Measured Fmax =", fmax)
+        error = (fmax - dF)/dF
+        print("Current error = ", error)
+
+        if abs(error) <= (errorRate/100.0):
+            error_acceptance_rate = True
+            ser.write(b"1\n")
+        elif count >= num_iteration:
+            ser.write(b"1\n")
+            break
+        elif abs(error) >= 1:
+            acceleration = acceleration - (0.1 * error * acceleration)
+            motor.set_acceleration(acceleration)
+            motor.set_deceleration(acceleration)
+            sleep(2)
+            ser.write(b"2\n")
+        else:
+            acceleration = acceleration - (error * acceleration)
+            motor.set_acceleration(acceleration)
+            motor.set_deceleration(acceleration)
+            sleep(2)
+            ser.write(b"2\n")
+print("All tests finished. Exiting.")
